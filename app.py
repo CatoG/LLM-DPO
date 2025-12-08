@@ -4,6 +4,7 @@ from datetime import datetime
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 import gradio as gr
 import pandas as pd
@@ -21,7 +22,7 @@ from trl import DPOConfig, DPOTrainer
 
 
 # =========================================================
-#  MODEL LIST (from your BIAS demo)
+#  MODEL LIST
 # =========================================================
 
 MODEL_CHOICES = [
@@ -92,7 +93,7 @@ DEFAULT_DPO_CONFIG = DPOConfig(
     logging_steps=1,
     gradient_accumulation_steps=1,
     learning_rate=1e-4,
-    evaluation_strategy="no",  # warning is fine with current versions
+    evaluation_strategy="no",
     warmup_steps=0,
     fp16=False,
     save_steps=0,
@@ -246,7 +247,6 @@ def build_generation_config(
     """
     Helper to build a GenerationConfig from UI settings.
     """
-    # Clamp values a bit just to be safe
     temperature = max(0.0, float(temperature))
     max_new_tokens = int(max_new_tokens)
     return GenerationConfig(
@@ -310,6 +310,41 @@ def list_trained_model_files() -> List[str]:
     return files
 
 
+def logprob_answer(
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    answer: str,
+) -> float:
+    """
+    Compute the log-probability of `answer` given `prompt`,
+    using a simple "User/Assistant" format:
+
+        full_text = "User: <prompt>\\nAssistant: <answer>"
+
+    We approximate p(answer | prompt) by summing log-probs of all tokens
+    in the answer region (the shared prompt part cancels in comparisons).
+    """
+    model.eval()
+    with torch.no_grad():
+        full_text = f"User: {prompt}\nAssistant: {answer}"
+        enc = tokenizer(
+            full_text,
+            return_tensors="pt",
+        ).to(device)
+
+        input_ids = enc["input_ids"]
+        out = model(input_ids=input_ids)
+        logits = out.logits[:, :-1, :]          # [B, T-1, V]
+        labels = input_ids[:, 1:]              # [B, T-1]
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        token_log_probs = log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+        total_logprob = token_log_probs.sum().item()
+
+    return float(total_logprob)
+
+
 # =========================================================
 #  DPO CALLBACKS
 # =========================================================
@@ -327,8 +362,6 @@ def generate_candidates(
     if not prompt.strip():
         return "", ""
 
-    # Build two configs from the same UI settings,
-    # but make B slightly more "wild" by bumping top_k / temperature a bit
     balanced_config = build_generation_config(
         do_sample=do_sample,
         temperature=temperature,
@@ -337,8 +370,6 @@ def generate_candidates(
         top_p=0.9,
     )
 
-    # For creative answer, nudge temperature and top_k a bit, but still
-    # keep them tied to UI settings.
     creative_temp = float(temperature) + 0.4
     creative_config = build_generation_config(
         do_sample=do_sample,
@@ -534,6 +565,76 @@ You can download them using the file list below.
     return msg, last_trained_msg, files
 
 
+def dpo_diagnostics(state_preferences: List[Dict]) -> str:
+    """
+    Compute how often the policy_model and ref_model
+    assign higher log-probability to the CHOSEN answer
+    than to the REJECTED answer.
+
+    Returns a markdown report with:
+      - number of pairs
+      - policy win rate
+      - ref win rate
+      - average logprob margins
+    """
+    if not state_preferences:
+        return "No preferences collected yet – nothing to evaluate."
+
+    if policy_model is None or ref_model is None or tokenizer is None:
+        return "Models not loaded – reload base model first."
+
+    n = len(state_preferences)
+    policy_wins = 0
+    ref_wins = 0
+
+    policy_margins = []
+    ref_margins = []
+
+    for ex in state_preferences:
+        prompt = ex["prompt"]
+        chosen = ex["chosen"]
+        rejected = ex["rejected"]
+
+        # Policy model logprobs
+        lp_pol_ch = logprob_answer(policy_model, tokenizer, prompt, chosen)
+        lp_pol_rj = logprob_answer(policy_model, tokenizer, prompt, rejected)
+        margin_pol = lp_pol_ch - lp_pol_rj
+        policy_margins.append(margin_pol)
+        if margin_pol > 0:
+            policy_wins += 1
+
+        # Reference model logprobs
+        lp_ref_ch = logprob_answer(ref_model, tokenizer, prompt, chosen)
+        lp_ref_rj = logprob_answer(ref_model, tokenizer, prompt, rejected)
+        margin_ref = lp_ref_ch - lp_ref_rj
+        ref_margins.append(margin_ref)
+        if margin_ref > 0:
+            ref_wins += 1
+
+    policy_winrate = policy_wins / n
+    ref_winrate = ref_wins / n
+
+    avg_pol_margin = sum(policy_margins) / n
+    avg_ref_margin = sum(ref_margins) / n
+
+    report = f"""### 📊 DPO Diagnostics
+
+Preference pairs evaluated: **{n}**
+
+**Policy model (after DPO)**  
+- Win rate (chosen > rejected): **{policy_winrate:.2%}**  
+- Avg logprob(chosen − rejected): **{avg_pol_margin:.3f}**
+
+**Reference model (base)**  
+- Win rate (chosen > rejected): **{ref_winrate:.2%}**  
+- Avg logprob(chosen − rejected): **{avg_ref_margin:.3f}**
+
+> A higher win rate and margin for the policy model compared to the reference model
+> indicates that DPO training is successfully shifting the model toward your preferences.
+"""
+    return report
+
+
 def generate_from_aligned_model(
     prompt: str,
     do_sample: bool,
@@ -602,7 +703,8 @@ with gr.Blocks() as demo:
     - Collect several preferences and **train the model with DPO**.
     - Test how the aligned policy model behaves on new prompts.
     - Download the tuned model (LoRA adapter + tokenizer) after training.
-    - **Control temperature, sampling, and max_new_tokens directly in the UI.**
+    - Use **DPO diagnostics** to see if the aligned model prefers your chosen answers
+      more often than the base model.
     """
     )
 
@@ -806,6 +908,17 @@ with gr.Blocks() as demo:
             outputs=test_answer,
         )
 
+        gr.Markdown("## 📈 DPO diagnostics")
+
+        diag_btn = gr.Button("Compute preference win rates (policy vs base)")
+        diag_output = gr.Markdown("")
+
+        diag_btn.click(
+            fn=dpo_diagnostics,
+            inputs=[state_preferences],
+            outputs=[diag_output],
+        )
+
     # model change: reload + clear prefs + reset train status + last trained + downloads
     model_dropdown.change(
         fn=on_model_change,
@@ -822,4 +935,3 @@ with gr.Blocks() as demo:
 
 if __name__ == "__main__":
     demo.queue().launch()
-
